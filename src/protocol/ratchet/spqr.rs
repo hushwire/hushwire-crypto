@@ -318,6 +318,21 @@ impl SpqrState {
 
     /// `ClearOldEpochs`: drop chains and skipped keys two epochs behind the sender
     /// (they can no longer be referenced).
+    ///
+    /// Epoch pruning is intentionally **send-path only**: this is called from
+    /// `ratchet_send_key`, never from `ratchet_receive_key`. We believe this matches
+    /// Signal's design, where epoch eviction is keyed off the sending epoch advancing
+    /// rather than the receiving one. The retained set is therefore bounded by the
+    /// gap between the current (highest braid) epoch and the local sending epoch, not
+    /// by message volume: a new epoch cannot be minted without a complete bidirectional
+    /// braid round-trip (`add_epoch` requires consecutive epochs and the braid only
+    /// emits an `output_key` after a full KEM exchange), so a party cannot run its
+    /// current epoch arbitrarily far ahead of its own send participation. A peer that
+    /// sends at all prunes on each send; a peer that sends nothing transmits no braid
+    /// chunks and so cannot advance the epoch past what is already in flight. The one
+    /// degenerate case is a peer that legitimately receives across many epochs while
+    /// never sending — its retained epochs grow with that send/receive gap until it
+    /// next sends. This is an inherent property of send-driven pruning, not a leak.
     fn clear_old_epochs(&mut self, sending_epoch: u64) {
         if let Some(old) = sending_epoch.checked_sub(2) {
             self.kdfchains.remove(&old);
@@ -570,6 +585,56 @@ mod tests {
         assert!(
             bob.ratchet_receive_key(&hmsg, hpqn).is_err(),
             "a message whose epoch chain was cleared must fail closed"
+        );
+    }
+
+    /// Receive-heavy bound: `ClearOldEpochs` runs only on the send path, so
+    /// a peer that receives far more than it sends prunes infrequently. This must NOT
+    /// translate into unbounded `kdfchains` growth: a new epoch cannot be minted
+    /// without a full bidirectional braid round-trip, so the retained set is bounded by
+    /// the send/receive epoch gap (the handshake pipeline depth, a small constant), not
+    /// by received-message volume. Drive a heavily asymmetric stream (Bob receives a
+    /// burst for every single reply) and assert Bob's retained epoch chains stay small
+    /// while the braid still makes epoch progress and every message pairs.
+    #[test]
+    fn receive_heavy_peer_retained_epochs_stay_bounded() {
+        let (mut alice, mut bob) = pair();
+        let mut ra = ChaCha20Rng::seed_from_u64(31);
+        let mut rb = ChaCha20Rng::seed_from_u64(32);
+
+        // Alice sends this many messages to Bob for each single Bob -> Alice reply.
+        const BURST: usize = 8;
+        let mut bob_max_chains = 0usize;
+        let mut max_epoch = 0u64;
+
+        for _ in 0..80 {
+            for _ in 0..BURST {
+                let (msg, pqn, mk_a) = alice.ratchet_send_key(&mut ra).unwrap();
+                let mk_b = bob.ratchet_receive_key(&msg, pqn).unwrap();
+                assert_eq!(mk_a, mk_b, "alice->bob pq_mk must pair under receive-heavy load");
+                bob_max_chains = bob_max_chains.max(bob.kdfchains.len());
+            }
+            // Bob's sole reply per burst -- this is the only place Bob's chains prune.
+            let (msg, pqn, mk_b) = bob.ratchet_send_key(&mut rb).unwrap();
+            let mk_a = alice.ratchet_receive_key(&msg, pqn).unwrap();
+            assert_eq!(mk_b, mk_a, "bob->alice reply pq_mk must pair");
+            bob_max_chains = bob_max_chains.max(bob.kdfchains.len());
+            max_epoch = max_epoch.max(bob.epoch);
+        }
+
+        assert!(
+            max_epoch >= 1,
+            "the braid must complete at least one epoch for this bound to be meaningful, reached {max_epoch}"
+        );
+        // The send/receive gap is bounded by the braid handshake depth, independent of
+        // the ~640 messages Bob received. A handful of epochs (current + a small lead +
+        // the two-behind retention window) is the structural ceiling; a regression that
+        // pruned on neither path, or grew per-message, would blow far past this.
+        assert!(
+            bob_max_chains <= 5,
+            "receive-heavy peer retained {bob_max_chains} epoch chains across {} received messages; \
+             send-driven pruning must keep this bounded by the epoch gap, not message volume",
+            80 * BURST
         );
     }
 }
