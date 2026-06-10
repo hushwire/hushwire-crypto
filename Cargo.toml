@@ -1,0 +1,43 @@
+[package]
+name = "hushwire-crypto"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license-file = "LICENSE"
+repository = "https://github.com/hushwire/hushwire-crypto"
+authors = ["Rob Wygand <rob@hushwire.io>"]
+description = "Clean-room Signal Protocol implementation for Hushwire"
+
+[dependencies]
+ed25519-dalek = { version = "2.2", features = ["std"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+curve25519-dalek = "4"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+subtle = "2"
+thiserror = "2"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+bytes = "1.11"
+bip39 = { version = "2", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+reed-solomon-simd = "3.1.0"
+# Only ML-KEM-768 + the incremental (braid) API. default-features disabled to
+# avoid libcrux's `rand` feature, whose code targets an older rand than the
+# crate's rand 0.10. We use only the deterministic, explicit-randomness API.
+libcrux-ml-kem = { version = "0.0.9", default-features = false, features = ["mlkem768", "incremental"] }
+rand_core = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["full", "signal"] }
+serde_json = "1.0"
+# Independent RS implementation, used only for the braid differential test.
+reed-solomon-erasure = "6.0.0"
+rand_chacha = "0.10.0"
