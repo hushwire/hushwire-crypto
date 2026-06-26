@@ -1,0 +1,108 @@
+(* ===================================================================== *)
+(*  braid_machine.pv  --  authenticator ratchet + fail-closed SAFETY       *)
+(*                                                                       *)
+(*  Two seams of the 11-state braid machine                              *)
+(*  (src/protocol/braid/state_machine.rs, src/protocol/braid/auth.rs):    *)
+(*                                                                       *)
+(*   (A) Authenticator unforgeability. The header MAC and the ciphertext  *)
+(*       MAC (mac_hdr/mac_ct over the ratcheting (root_key,mac_key),      *)
+(*       auth.rs:108,113) cannot be forged. So an illegal transition --   *)
+(*       accepting a header or ciphertext the peer never sent -- is       *)
+(*       unreachable, and the epoch secret is emitted only after a real   *)
+(*       round-trip whose ciphertext MAC verifies (vfy_ct fail-closed,    *)
+(*       state_machine.rs recv_ek_sent_ct1_received).                     *)
+(*                                                                       *)
+(*   (B) Fail-closed codeword binding (the CRITICAL property, decision    *)
+(*       D2: SAFETY only). The braid codeword rides in the AEAD associated *)
+(*       data (ratchet/header.rs + build_ad, ratchet/mod.rs). Stripping it *)
+(*       (idle/no-PQ) or garbling it changes the AD, the AEAD tag fails,   *)
+(*       and the message is rejected -- never a silent classical-only      *)
+(*       downgrade.                                                       *)
+(*                                                                       *)
+(*  NOT modelled here: availability / message-loss-resume                 *)
+(*  ("a dropped codeword does not permanently wedge the session; honest   *)
+(*  re-streamed codewords rebuild via Decoder::reset"). That is a liveness *)
+(*  property the Dolev-Yao attacker (who owns the network) can always      *)
+(*  defeat by dropping delivery; it is evidenced by the Rust tests in     *)
+(*  src/protocol/ratchet/spqr.rs, not here.                              *)
+(*                                                                       *)
+(*  Run:  proverif -lib proofs/common proofs/braid_machine.pv             *)
+(* ===================================================================== *)
+
+free net: channel.
+const e1: bitstring.                 (* epoch identifier (bounded model, D1) *)
+const id_snd: bitstring.                (* sender identity (x25519), in the AD *)
+const id_rcv: bitstring.                (* recipient identity, in the AD *)
+const cw_real: bitstring.            (* the genuine braid codeword for the message *)
+const cw_idle: bitstring.            (* the "no PQ codeword" downgrade attempt *)
+free msg_secret: bitstring [private].
+
+(* -- (A) authenticator unforgeability -- *)
+event SentHeader(bitstring, kempk).
+event AcceptHeader(bitstring, kempk).
+event SentCt(bitstring, bitstring).
+event AcceptCt(bitstring, bitstring).
+
+query e: bitstring, pk: kempk;
+    event(AcceptHeader(e, pk)) ==> event(SentHeader(e, pk)).   (* QA1 *)
+query e: bitstring, ct: bitstring;
+    event(AcceptCt(e, ct)) ==> event(SentCt(e, ct)).           (* QA2 *)
+
+(* -- (B) fail-closed codeword binding -- *)
+event SentMsg(bitstring).            (* codeword stamped into the AD *)
+event AcceptedMsg(bitstring).        (* codeword the receiver decrypted under *)
+
+query cw: bitstring;
+    event(AcceptedMsg(cw)) ==> event(SentMsg(cw)).             (* QB1 no acceptance under a codeword the sender didn't stamp *)
+query event(AcceptedMsg(cw_idle)).                             (* QB2 downgrade unreachable: expect FALSE *)
+query attacker(msg_secret).                                    (* QB3 message secrecy *)
+
+(* Sanity / non-vacuity: the honest paths ARE reachable, so the correspondence
+   and downgrade queries are not vacuously true. Expected: REACHABLE for both. *)
+query event(AcceptedMsg(cw_real)).                             (* SN1 legit codeword accepted *)
+query e: bitstring, ct: bitstring; event(AcceptCt(e, ct)).     (* SN2 round-trip completes *)
+
+(* ---------------- (A) authenticator round-trip ---------------- *)
+(* macK abstracts the per-epoch authenticator MAC key (auth ratchet output,
+   seeded from the shared session). Attacker lacks `sess` => lacks macK. *)
+
+let responder(sess: key) =                  (* keygen + decapsulate + emit secret *)
+    let macK = kdf_ok(sess, e1) in
+    new sk: kemsk;
+    let pk = kem_pub(sk) in
+    event SentHeader(e1, pk);
+    out(net, (pk, mac_hdr(macK, e1, pk)));
+    in(net, (ct: bitstring, cmac: key));
+    if cmac = mac_ct(macK, e1, ct) then     (* vfy_ct: fail closed *)
+        event AcceptCt(e1, ct).             (* epoch secret emitted only on this path *)
+
+let initiator(sess: key) =                  (* verify header + encapsulate *)
+    let macK = kdf_ok(sess, e1) in
+    in(net, (pk: kempk, hmac: key));
+    if hmac = mac_hdr(macK, e1, pk) then     (* vfy_hdr: fail closed *)
+        event AcceptHeader(e1, pk);
+        new r: coins;
+        let ct = kem_ct(pk, r) in
+        event SentCt(e1, ct);
+        out(net, (ct, mac_ct(macK, e1, ct))).
+
+(* ---------------- (B) data message with codeword in AD ---------------- *)
+(* mk abstracts the per-message hybrid key (combiner.pv proves it is shared
+   and secret). Here the focus is the AD binding of the codeword. *)
+
+let msg_sender(mk: key) =
+    event SentMsg(cw_real);
+    let ad = (id_snd, id_rcv, cw_real) in          (* build_ad: identities || header(codeword) *)
+    out(net, (cw_real, aead_enc(mk, ad, msg_secret))).
+
+let msg_receiver(mk: key) =
+    in(net, (cw_recv: bitstring, ciph: bitstring));   (* attacker may alter cw_recv freely *)
+    let ad = (id_snd, id_rcv, cw_recv) in
+    let m = aead_dec(mk, ad, ciph) in         (* fails closed unless cw_recv = cw_real *)
+    event AcceptedMsg(cw_recv).
+
+process
+    new sess: key;
+    new mk: key;
+    ( responder(sess) | initiator(sess)
+    | msg_sender(mk) | msg_receiver(mk) )

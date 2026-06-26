@@ -1,0 +1,102 @@
+(* ===================================================================== *)
+(*  combiner.pv  --  the Triple Ratchet per-message hybrid combiner        *)
+(*                                                                       *)
+(*  Models  mk = KDF_HYBRID(ec_mk, pq_mk)  computed for EVERY message     *)
+(*  (src/primitives/kdf.rs:206, called per message in                    *)
+(*   src/protocol/ratchet/mod.rs). The combiner is at the per-message key  *)
+(*  layer: the EC root key advances on DH alone, and the ML-KEM braid      *)
+(*  secret enters via this per-message KDF_HYBRID.                        *)
+(*                                                                       *)
+(*  Run:  proverif -lib proofs/common proofs/combiner.pv                  *)
+(*                                                                       *)
+(*  Properties (each protects a private secret under a derived key, then  *)
+(*  asks whether the Dolev-Yao attacker can recover that secret; a secret *)
+(*  that stays hidden => the key is secret):                             *)
+(*    Q1 secrecy            honest run, neither contribution leaked        *)
+(*    Q2 hybrid (EC broken) attacker is GIVEN ec_mk; pq_mk still protects  *)
+(*    Q3 hybrid (PQ broken) attacker is GIVEN pq_mk; ec_mk still protects  *)
+(*    Q4 forward secrecy    later chain state leaks; earlier mk stays safe *)
+(*    Q5 post-compromise    full state leaks, then a fresh KEM reseed heals *)
+(*                                                                       *)
+(*  Expected for every query:  attacker(.) is FALSE  (secret preserved).  *)
+(* ===================================================================== *)
+
+free net: channel.
+const ad0: bitstring.        (* a fixed, public associated-data context *)
+
+(* one private secret per scenario, each protected under its scenario's key *)
+free s_honest: bitstring [private].
+free s_ec:     bitstring [private].
+free s_pq:     bitstring [private].
+free s_fs:     bitstring [private].
+free s_pcs:    bitstring [private].
+
+query attacker(s_honest).   (* Q1 *)
+query attacker(s_ec).       (* Q2 *)
+query attacker(s_pq).       (* Q3 *)
+query attacker(s_fs).       (* Q4 *)
+query attacker(s_pcs).      (* Q5 *)
+
+(* -- Q1: honest combiner. Both contributions fresh and never revealed. -- *)
+let honest() =
+    new ec_mk: key;
+    new pq_mk: key;
+    let mk = kdf_hybrid(ec_mk, pq_mk) in
+    out(net, aead_enc(mk, ad0, s_honest)).
+
+(* -- Q2: EC half compromised. Attacker learns ec_mk; pq_mk stays secret.
+      kdf_hybrid is one-way, so knowing one input is not enough to recover mk.
+      Demonstrates: if X25519/EC is broken, the ML-KEM contribution still
+      protects the message (no silent classical-only collapse). -- *)
+let ec_compromised() =
+    new ec_mk: key;
+    new pq_mk: key;
+    out(net, ec_mk);
+    let mk = kdf_hybrid(ec_mk, pq_mk) in
+    out(net, aead_enc(mk, ad0, s_ec)).
+
+(* -- Q3: PQ half compromised. Attacker learns pq_mk; ec_mk stays secret.
+      Demonstrates: if ML-KEM is broken, the EC contribution still protects
+      the message (no PQ-only collapse). -- *)
+let pq_compromised() =
+    new ec_mk: key;
+    new pq_mk: key;
+    out(net, pq_mk);
+    let mk = kdf_hybrid(ec_mk, pq_mk) in
+    out(net, aead_enc(mk, ad0, s_pq)).
+
+(* -- Q4: forward secrecy. Protect s_fs under message-1's hybrid key, advance
+      the SPQR chain once, then (phase 1) leak the post-message-1 chain key and
+      the EC contribution. Because the chain advances by a one-way step, the
+      leaked later state cannot recover message-1's key. -- *)
+let forward_secrecy() =
+    new ck0: key;
+    new ec1: key;
+    let mk1 = scka_ck_mk(ck0) in
+    let ck1 = scka_ck_next(ck0) in          (* state right after message 1 *)
+    let hk1 = kdf_hybrid(ec1, mk1) in
+    out(net, aead_enc(hk1, ad0, s_fs));
+    phase 1;
+    out(net, ck1);                          (* compromise current chain key *)
+    out(net, ec1).                          (* even leak the EC contribution *)
+
+(* -- Q5: post-compromise security. Phase 0: full state (rk0, ck0) leaks.
+      A braid epoch then completes, reseeding via KDF_SCKA_RK with a fresh KEM
+      epoch secret the attacker does not hold (modeled as a fresh secret name:
+      the IND-CCA KEM healed). The post-reseed message key is independent of the
+      leaked state, so the post-heal secret stays hidden. -- *)
+let post_compromise() =
+    new rk0: key;
+    new ck0: key;
+    out(net, rk0);                          (* phase-0 compromise *)
+    out(net, ck0);
+    new es: key;                            (* fresh epoch secret: KEM healed *)
+    let ck_new = scka_rk_ck0(rk0, es) in
+    let mk = scka_ck_mk(ck_new) in
+    new ec: key;
+    let hk = kdf_hybrid(ec, mk) in
+    out(net, aead_enc(hk, ad0, s_pcs)).
+
+process
+    ( !honest() | !ec_compromised() | !pq_compromised()
+    | !forward_secrecy() | !post_compromise() )

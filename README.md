@@ -82,6 +82,15 @@ This implementation is clean-room from the published Signal specifications. Ever
 deviation is catalogued, classified, and justified in
 [`docs/signal-spec-divergence.md`](docs/signal-spec-divergence.md).
 
+## Formal model
+
+A clean-room ProVerif (symbolic) model of the ML-KEM Braid / Triple Ratchet seams —
+the per-message hybrid combiner, fold-epoch synchronisation, the braid authenticator,
+and the fail-closed codeword binding — lives in [`proofs/`](proofs/). It is an
+auditor-facing design-validation artifact, **not** a proof of this Rust and **not** a CI
+gate; see [`proofs/README.md`](proofs/README.md) for scope, the term→source map, and the
+machine-checked results.
+
 ## License
 
 Proprietary — Copyright (c) 2026 Hushwire. All rights reserved. See [`LICENSE`](LICENSE).
