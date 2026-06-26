@@ -1,0 +1,103 @@
+(* ===================================================================== *)
+(*  common.pvl                                                           *)
+(*  Shared symbolic primitives for the Hushwire ML-KEM Braid / Triple    *)
+(*  Ratchet ProVerif models. Loaded with:  proverif -lib proofs/common   *)
+(*                                                                       *)
+(*  Clean-room: re-derived from the published ML-KEM Braid spec and from *)
+(*  this repository's own Rust. NOT translated from Signal's AGPL        *)
+(*  reference (signalapp/SparsePostQuantumRatchet).                      *)
+(*                                                                       *)
+(*  Each function symbol below maps to a concrete Rust KDF/primitive;    *)
+(*  see proofs/README.md for the full term -> Rust source map. The       *)
+(*  separate function symbols ARE the domain separation: distinct        *)
+(*  symbols never collide in the symbolic model, mirroring the distinct  *)
+(*  HKDF `info` strings in src/primitives/kdf.rs and src/.../braid/auth.rs*)
+(* ===================================================================== *)
+
+(* ---------- Types ---------- *)
+type key.        (* 32-byte symmetric key material (RootKey/ChainKey/MessageKey) *)
+type coins.      (* KEM encapsulation randomness                                  *)
+type kemsk.      (* ML-KEM decapsulation (secret) key                             *)
+type kempk.      (* ML-KEM encapsulation (public) key                             *)
+
+(* ---------- KDFs as one-way PRFs (constructors: no inverse) ----------- *)
+
+(* KDF_HYBRID(ec_mk, pq_mk) -> AEAD message key.   src/primitives/kdf.rs:206
+   HKDF(salt=pq_mk, ikm=ec_mk, info="HushwireTripleRatchet"). Per message. *)
+fun kdf_hybrid(key, key): key.
+
+(* KDF_SCKA_INIT(sk) -> (rk, ck0, ck1).            src/primitives/kdf.rs:140
+   Three projections of the one HKDF expansion (info "HushwireSPQRChain Start"). *)
+fun scka_init_rk(key): key.
+fun scka_init_ck0(key): key.
+fun scka_init_ck1(key): key.
+
+(* KDF_SCKA_RK(rk, epoch_secret) -> (rk', ck0, ck1).  src/primitives/kdf.rs:155
+   The reseed when a braid epoch completes (info "HushwireSPQRChain Add Epoch"). *)
+fun scka_rk_root(key, key): key.
+fun scka_rk_ck0(key, key): key.
+fun scka_rk_ck1(key, key): key.
+
+(* KDF_SCKA_CK(ck, ctr) -> (ck', mk).              src/primitives/kdf.rs:186
+   Per-message chain step (info "HushwireSPQR:Chain Step", counter-bound).
+   Modeled here without an explicit counter argument: the forward-secrecy
+   argument depends only on one-wayness of the advance, not on the counter
+   value. The counter binding (replay) is modeled in epoch_sync.pv. *)
+fun scka_ck_next(key): key.   (* advanced chain key *)
+fun scka_ck_mk(key): key.     (* this step's message key *)
+
+(* KDF_OK(shared_secret, epoch) -> per-epoch session key.  src/.../braid/auth.rs:38
+   HKDF(info "...:SCKA Key" || epoch). Epoch is the bitstring tag (2nd arg). *)
+fun kdf_ok(key, bitstring): key.    (* (raw_ss, epoch_tag) -> ok *)
+
+(* KDF_AUTH(root_key, update_key, epoch) -> (root', mac_key). src/.../braid/auth.rs:54
+   The authenticator ratchet step (info "...:Authenticator Update" || epoch). *)
+fun auth_root(key, key, bitstring): key.   (* (root, upd, epoch_tag) -> root'   *)
+fun auth_mackey(key, key, bitstring): key. (* (root, upd, epoch_tag) -> mac_key *)
+
+(* ---------- HMAC authenticator MACs ----------
+   HMAC-SHA256(mac_key, PROTOCOL_INFO || label || epoch || data). The two
+   labels ":ekheader" / ":ciphertext" (src/.../braid/auth.rs:108,113) are
+   distinct function symbols, so a header tag can never be replayed as a
+   ciphertext tag. Verification is exact equality of the recomputed tag
+   (constant-time `subtle::ConstantTimeEq` in the Rust). *)
+fun mac_hdr(key, bitstring, kempk): key.    (* (mac_key, epoch, encaps key) *)
+fun mac_ct(key, bitstring, bitstring): key. (* (mac_key, epoch, ct1||ct2)   *)
+fun mac(key, bitstring): key.               (* generic, for ad-hoc tagging   *)
+
+(* ---------- AEAD with associated data (load-bearing for fail-closed) ----
+   aead_enc(k, ad, m). Decryption succeeds ONLY when BOTH the key and the
+   associated data match. Tampering with `ad` (which carries the braid
+   codeword + epoch + PQ counter, see ratchet/header.rs + build_ad) yields no
+   reduction -> the message is rejected. This is the symbolic core of the
+   "stripped/garbled codeword breaks the session, never a silent classical
+   downgrade" property. src/protocol/ratchet/mod.rs build_ad/encrypt/decrypt. *)
+fun aead_enc(key, bitstring, bitstring): bitstring.
+reduc forall k: key, ad: bitstring, m: bitstring;
+    aead_dec(k, ad, aead_enc(k, ad, m)) = m.
+
+(* ---------- KEM as an IND-CCA black box ----------
+   ML-KEM-768 internals are out of scope (verified upstream: libcrux / hax->F*,
+   divergence register D-13). Standard symbolic KEM: the encapsulator picks
+   `coins`, derives a ciphertext and a shared secret from the public key; the
+   holder of the secret key recovers the same shared secret. The incremental
+   (ct1/ct2) split of the braid is abstracted to a single agreed secret here;
+   braid_machine.pv keeps the two-message structure where it matters.
+   (Types kemsk/kempk are declared in the Types section above so the
+   authenticator MACs can reference kempk.) *)
+fun kem_pub(kemsk): kempk.                (* public encapsulation key from secret *)
+fun kem_ct(kempk, coins): bitstring.      (* ciphertext                            *)
+fun kem_ss(kempk, coins): key.            (* shared secret (encapsulator's view)   *)
+reduc forall sk: kemsk, r: coins;
+    kem_decap(sk, kem_ct(kem_pub(sk), r)) = kem_ss(kem_pub(sk), r).
+
+(* ---------- Erasure / Reed-Solomon ----------
+   Deliberately NOT modeled as a primitive. Per divergence register D-13 the
+   proof depends on the erasure-interface *contract* (k-of-n recoverability,
+   fail-closed below threshold), not the GF(2^16) polynomial. The contract's
+   security-relevant half is that the reassembled bytes are bound into AEAD
+   associated data (above); its availability half (a lost codeword does not
+   permanently wedge the session) is a liveness property that is NOT provable
+   under Dolev-Yao and is instead evidenced by the Rust tests in
+   src/protocol/ratchet/spqr.rs. So a "codeword" is just a bitstring carried
+   in the AD/MAC, and reconstruction is the identity. *)

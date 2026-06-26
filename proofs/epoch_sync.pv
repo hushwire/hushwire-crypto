@@ -1,0 +1,85 @@
+(* ===================================================================== *)
+(*  epoch_sync.pv  --  fold-epoch synchronisation / no-divergence          *)
+(*                                                                       *)
+(*  When a braid epoch completes, both peers reseed the SPQR chain with   *)
+(*  the SAME epoch secret  es = KDF_OK(raw_ss, epoch)  derived from the    *)
+(*  KEM round-trip (src/protocol/ratchet/spqr.rs:170 add_epoch;           *)
+(*  src/protocol/braid/state_machine.rs epoch completion;                 *)
+(*  src/protocol/braid/auth.rs:38 kdf_ok). This model proves that a       *)
+(*  receiver never folds a secret the sender did not produce, and that    *)
+(*  the folded secret stays hidden from the network attacker.            *)
+(*                                                                       *)
+(*  The code has NO explicit `min(my_completed, peer_completed)`.          *)
+(*  Synchronisation is achieved by (a) the one-epoch lag                  *)
+(*  `sending_epoch = epoch-1` (state_machine.rs), (b) the consecutive-     *)
+(*  epoch guard in add_epoch that fails closed otherwise (spqr.rs:171),    *)
+(*  and (c) `receiving_epoch` read from the message's own epoch field.     *)
+(*  The per-epoch authentication modelled below is the seam those three    *)
+(*  enforce; epoch monotonicity itself is bounded out of the symbolic      *)
+(*  model and anchored by the Rust tests                                  *)
+(*  add_epoch_non_consecutive_fails_closed / replay_fails_closed.         *)
+(*                                                                       *)
+(*  Run:  proverif -lib proofs/common proofs/epoch_sync.pv                *)
+(*                                                                       *)
+(*  Q1 agreement : if the keygen/decapsulator folds (e,s), the            *)
+(*                 encapsulator folded the identical (e,s)  (no divergence)*)
+(*  Q2 secrecy   : the folded epoch secret is hidden from the attacker.   *)
+(* ===================================================================== *)
+
+free net: channel.
+const e1: bitstring.            (* epoch identifier (bounded model, D1) *)
+free probe: bitstring [private].
+
+event SenderFold(bitstring, key).    (* encapsulator completes epoch e with es  *)
+event ReceiverFold(bitstring, key).  (* keygen party completes epoch e with es  *)
+
+(* Q1: no-divergence. Receiver's fold value is always one the sender produced. *)
+query e: bitstring, s: key;
+    event(ReceiverFold(e, s)) ==> event(SenderFold(e, s)).
+
+(* Q2: the folded epoch secret is secret (es is good key material). *)
+query attacker(probe).
+
+(* Sanity / non-vacuity: the honest fold IS reachable, so Q1/Q2 are not
+   vacuously true. Expected: REACHABLE (ProVerif prints "... is false" + a
+   derivation, meaning the event can occur on the honest run). *)
+query s: key; event(ReceiverFold(e1, s)).
+
+(* Per-epoch authenticator MAC key, derived from the PQXDH session secret
+   `sess` (the authenticator is seeded from the shared session; auth.rs).
+   Attacker lacks `sess`, hence lacks macK, hence cannot forge a header or
+   ciphertext tag. *)
+
+(* keygen party: publishes the (authenticated) encapsulation key, then
+   decapsulates the (authenticated) ciphertext and folds. Mirrors the braid
+   responder path + vfy_ct fail-closed (state_machine.rs recv_ek_sent_ct1_received). *)
+let keygen_party(sess: key) =
+    let macK = kdf_ok(sess, e1) in
+    new sk: kemsk;
+    let pk = kem_pub(sk) in
+    out(net, (pk, mac_hdr(macK, e1, pk)));          (* header + MAC *)
+    in(net, (ct: bitstring, cmac: key));
+    if cmac = mac_ct(macK, e1, ct) then             (* vfy_ct: fail closed *)
+        let raw_ss = kem_decap(sk, ct) in
+        let es = kdf_ok(raw_ss, e1) in
+        event ReceiverFold(e1, es);
+        out(net, aead_enc(es, e1, probe)).
+
+(* encapsulator: verifies the header, encapsulates, folds, and returns the
+   authenticated ciphertext. Mirrors the braid encapsulate path + vfy_hdr
+   (state_machine.rs HeaderReceived -> Ct1Sampled). *)
+let encapsulator(sess: key) =
+    let macK = kdf_ok(sess, e1) in
+    in(net, (pk: kempk, hmac: key));
+    if hmac = mac_hdr(macK, e1, pk) then            (* vfy_hdr: fail closed *)
+        new r: coins;
+        let ct = kem_ct(pk, r) in
+        let raw_ss = kem_ss(pk, r) in
+        let es = kdf_ok(raw_ss, e1) in
+        event SenderFold(e1, es);
+        out(net, (ct, mac_ct(macK, e1, ct))).
+
+(* One session, one epoch (bounded per D1): both roles run once. *)
+process
+    new sess: key;
+    ( keygen_party(sess) | encapsulator(sess) )

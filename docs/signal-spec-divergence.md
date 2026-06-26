@@ -243,7 +243,7 @@ this matches the specification.
 | **Classification** | Compliant (construction); clean-room implementation |
 | **Source** | `src/braid/` -- `BraidState`, `erasure`, `kem`, `auth`; `src/ratchet/spqr.rs` -- `SpqrState`; `src/ratchet/mod.rs` -- `encrypt_raw`/`decrypt` (the `KDF_HYBRID` combine); `src/kdf.rs` -- the SPQR KDFs |
 | **Signal** | ML-KEM is used in the initial PQXDH handshake. For continuous post-quantum key agreement Signal specifies the ML-KEM Braid + the Sparse Post-Quantum Ratchet (the "Triple Ratchet", eprint 2025/078): a sparse, state-machine-based KEM ratchet whose large keys/ciphertexts are streamed via erasure coding, producing a fresh secret roughly every ~74 messages. The SPQR is an independent ratchet that emits a per-message key; for **every** message the AEAD key is `KDF_HYBRID(ec_mk, pq_mk)` (Double Ratchet spec section 6), combined at the message-key layer -- **not** folded into the Double Ratchet root key. |
-| **Hushwire** | Implements that construction. The braid (`src/braid/`) runs the 11-state machine (the SCKA); `SpqrState` (`src/ratchet/spqr.rs`) is the spec section 5 `spqr_state` -- per-epoch KDF chains reseeded by `KDF_SCKA_RK` at each completion epoch, bootstrapped by `KDF_SCKA_INIT`, with an `(epoch, n)`-indexed skipped-key store. Every message's AEAD key is `mk = KDF_HYBRID(ec_mk, pq_mk)`; the EC root key is classical DH-only. This **replaces** both the prior novel per-step PQ ratchet (the original D-13) and the interim root-key fold (issue #535 comment, retracted), which mirrored neither Signal's construction nor its proof. |
+| **Hushwire** | Implements that construction. The braid (`src/braid/`) runs the 11-state machine (the SCKA); `SpqrState` (`src/ratchet/spqr.rs`) is the spec section 5 `spqr_state` -- per-epoch KDF chains reseeded by `KDF_SCKA_RK` at each completion epoch, bootstrapped by `KDF_SCKA_INIT`, with an `(epoch, n)`-indexed skipped-key store. Every message's AEAD key is `mk = KDF_HYBRID(ec_mk, pq_mk)`; the EC root key is classical DH-only. |
 
 **Construction is compliant; the implementation is clean-room.** Unlike the
 original D-13 (a novel, every-step, full-size PQ mix with no published proof),
@@ -537,7 +537,7 @@ attacker who persistently drops codeword-bearing messages can deny service, but
 cannot weaken the cryptography -- the same property as any MITM who drops
 traffic.)
 
-**Bootstrap (no PQ-absent window).** Unlike the prior root-key fold, the hybrid is
+**Bootstrap (no PQ-absent window).** The hybrid is
 active from message 1: the SPQR's epoch-0 chains are seeded by `KDF_SCKA_INIT` from
 the session secret, so `pq_mk` -- and therefore `KDF_HYBRID(ec_mk, pq_mk)` -- exists
 before the braid completes its first KEM epoch. The bootstrap `pq_mk` is derived
@@ -610,6 +610,13 @@ chains, reseed, `(epoch, n)` skipped-key store), and the combiner (both peers
 deriving the identical `pq_mk`, and `KDF_HYBRID(ec_mk, pq_mk)` per message). The
 `ml-kem`/`libcrux-ml-kem` primitive itself is out of scope (separately verified
 upstream).
+
+A clean-room ProVerif (symbolic) model of exactly these seams — the per-message
+`KDF_HYBRID` combiner, fold-epoch synchronisation, the braid authenticator, and the
+fail-closed codeword binding — is maintained in [`../proofs/`](../proofs/). 
+It is an auditor-facing design-validation artifact, not a proof of the Rust
+and not a CI gate; see [`../proofs/README.md`](../proofs/README.md) for the term→source
+map, scope, and machine-checked results.
 
 
 ## Cryptographic dependencies
