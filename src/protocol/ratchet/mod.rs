@@ -1482,4 +1482,249 @@ mod tests {
             "the braid must complete an epoch after a mid-stream restore"
         );
     }
+
+    // ── Property-based fail-closed coverage (bolero) ─────────────────────────
+    //
+    // One body per property. Each runs as a fast unit test under `cargo test`
+    // (bolero's default ~1s time budget per property) AND as a libfuzzer target
+    // under `cargo bolero test <name> --engine libfuzzer` (and, later, a Kani
+    // harness under `--engine kani`). Every closure builds a FRESH session pair
+    // per input (`fresh_pair`) so ratchet state never bleeds between iterations
+    // and the skipped-key store cannot grow unbounded across a fuzz campaign.
+    //
+    // The session/AEAD layer draws from the thread RNG internally (DH keypairs,
+    // SPQR send), so these bodies are not fully input-deterministic; full
+    // determinism (needed for the Kani engine) is part of the later
+    // pure-core-extraction track, not Tier 1.
+    use bolero::check;
+
+    fn fresh_pair() -> (RatchetSession, RatchetSession) {
+        let ss = make_shared_secret();
+        let bob_dh = make_dh_keypair();
+        (
+            RatchetSession::initialize_alice(&ss, &bob_dh.1).unwrap(),
+            RatchetSession::initialize_bob(&ss, bob_dh),
+        )
+    }
+
+    /// P1: arbitrary plaintext round-trips through the real encrypt/decrypt path
+    /// (also exercises pad/unpad over every length).
+    #[test]
+    fn prop_roundtrip() {
+        let alice_id = IdentityKeyPair::generate().public_key();
+        let bob_id = IdentityKeyPair::generate().public_key();
+        check!().with_type::<Vec<u8>>().for_each(|pt| {
+            let (mut alice, mut bob) = fresh_pair();
+            let msg = alice.encrypt(pt, &alice_id, &bob_id).unwrap();
+            assert_eq!(&bob.decrypt(&msg, &alice_id, &bob_id).unwrap(), pt);
+        });
+    }
+
+    /// P1b: a multi-message, bidirectional interleaving round-trips, exercising
+    /// the DH ratchet step (on each direction change) and chain advance — not
+    /// just a single message.
+    #[test]
+    fn prop_multi_message_dh_ratchet_roundtrip() {
+        let alice_id = IdentityKeyPair::generate().public_key();
+        let bob_id = IdentityKeyPair::generate().public_key();
+        check!()
+            .with_type::<Vec<(bool, Vec<u8>)>>()
+            .for_each(|sched| {
+                let (mut alice, mut bob) = fresh_pair();
+                let mut bob_can_send = false;
+                for (to_bob, pt) in sched.iter().take(24) {
+                    // Bob has no sending chain until he has received from Alice,
+                    // so force Alice->Bob until then (standard Double Ratchet).
+                    if *to_bob || !bob_can_send {
+                        let m = alice.encrypt(pt, &alice_id, &bob_id).unwrap();
+                        assert_eq!(&bob.decrypt(&m, &alice_id, &bob_id).unwrap(), pt);
+                        bob_can_send = true;
+                    } else {
+                        let m = bob.encrypt(pt, &bob_id, &alice_id).unwrap();
+                        assert_eq!(&alice.decrypt(&m, &bob_id, &alice_id).unwrap(), pt);
+                    }
+                }
+            });
+    }
+
+    /// P2: any mutation of the ciphertext fails closed — never `Ok` with altered
+    /// plaintext.
+    #[test]
+    fn prop_ciphertext_mutation_fails_closed() {
+        let alice_id = IdentityKeyPair::generate().public_key();
+        let bob_id = IdentityKeyPair::generate().public_key();
+        check!()
+            .with_type::<(Vec<u8>, usize, u8)>()
+            .for_each(|(pt, idx, mask)| {
+                let (mut alice, mut bob) = fresh_pair();
+                let mut msg = alice.encrypt(pt, &alice_id, &bob_id).unwrap();
+                if msg.ciphertext.is_empty() {
+                    return;
+                }
+                let i = *idx % msg.ciphertext.len();
+                msg.ciphertext[i] ^= *mask | 1; // `| 1` guarantees a real change
+                assert!(
+                    bob.decrypt(&msg, &alice_id, &bob_id).is_err(),
+                    "mutated ciphertext must fail closed"
+                );
+            });
+    }
+
+    /// P3: AD binding — any header mutation, or a swapped sender identity, fails
+    /// closed (the whole header + both identities are bound into the AEAD AD).
+    #[test]
+    fn prop_ad_binding_fails_closed() {
+        let alice_id = IdentityKeyPair::generate().public_key();
+        let bob_id = IdentityKeyPair::generate().public_key();
+        let eve_id = IdentityKeyPair::generate().public_key();
+        check!()
+            .with_type::<(Vec<u8>, usize, u8, bool)>()
+            .for_each(|(pt, idx, mask, swap_id)| {
+                let (mut alice, mut bob) = fresh_pair();
+                let mut msg = alice.encrypt(pt, &alice_id, &bob_id).unwrap();
+                if *swap_id {
+                    // Authentic bytes, wrong bound identity -> AD mismatch.
+                    assert!(
+                        bob.decrypt(&msg, &eve_id, &bob_id).is_err(),
+                        "wrong sender identity must fail closed"
+                    );
+                } else {
+                    if msg.header.is_empty() {
+                        return;
+                    }
+                    let i = *idx % msg.header.len();
+                    msg.header[i] ^= *mask | 1;
+                    assert!(
+                        bob.decrypt(&msg, &alice_id, &bob_id).is_err(),
+                        "mutated header must fail closed"
+                    );
+                }
+            });
+    }
+
+    /// P4: stripping (idle-swap) or garbling the braid codeword fails closed —
+    /// never a silent downgrade to classical-only. Warms up so a real codeword is
+    /// streaming; skips iterations where this message carries no chunk.
+    #[test]
+    fn prop_codeword_strip_or_garble_fails_closed() {
+        let alice_id = IdentityKeyPair::generate().public_key();
+        let bob_id = IdentityKeyPair::generate().public_key();
+        check!()
+            .with_type::<(Vec<u8>, bool)>()
+            .for_each(|(pt, garble)| {
+                let (mut alice, mut bob) = fresh_pair();
+                for i in 0..12u32 {
+                    let m = alice
+                        .encrypt(format!("warm{i}").as_bytes(), &alice_id, &bob_id)
+                        .unwrap();
+                    bob.decrypt(&m, &alice_id, &bob_id).unwrap();
+                    let r = bob.encrypt(b"ok", &bob_id, &alice_id).unwrap();
+                    alice.decrypt(&r, &bob_id, &alice_id).unwrap();
+                }
+                let mut msg = alice.encrypt(pt, &alice_id, &bob_id).unwrap();
+                let mut header = MessageHeader::deserialize(&msg.header).unwrap();
+                if header.braid_msg.chunk.is_none() {
+                    return; // no codeword to strip this round
+                }
+                if *garble {
+                    for b in header.braid_msg.chunk.as_mut().unwrap().data.iter_mut() {
+                        *b ^= 0xFF;
+                    }
+                } else {
+                    header.braid_msg =
+                        crate::protocol::braid::Message::idle(header.braid_msg.epoch);
+                }
+                msg.header = header.serialize();
+                assert!(
+                    bob.decrypt(&msg, &alice_id, &bob_id).is_err(),
+                    "stripped/garbled codeword must fail closed"
+                );
+            });
+    }
+
+    /// P4b: out-of-order EC delivery within `MAX_SKIP` resolves via the
+    /// skipped-key store; every delivered message decrypts to its own plaintext.
+    /// (Beyond-`MAX_SKIP` rejection is pinned by `max_skip_exceeded_returns_error`.)
+    #[test]
+    fn prop_out_of_order_within_chain() {
+        let alice_id = IdentityKeyPair::generate().public_key();
+        let bob_id = IdentityKeyPair::generate().public_key();
+        check!().with_type::<Vec<u8>>().for_each(|order_seed| {
+            let (mut alice, mut bob) = fresh_pair();
+            // Establish bob's receiving chain.
+            let prime = alice.encrypt(b"prime", &alice_id, &bob_id).unwrap();
+            bob.decrypt(&prime, &alice_id, &bob_id).unwrap();
+            let k = 2 + (order_seed.len() % 8); // 2..=9, well within MAX_SKIP
+            let msgs: Vec<RatchetMessage> = (0..k)
+                .map(|i| {
+                    alice
+                        .encrypt(format!("m{i}").as_bytes(), &alice_id, &bob_id)
+                        .unwrap()
+                })
+                .collect();
+            // Permute the delivery order by the input (stays a permutation).
+            let mut idx: Vec<usize> = (0..k).collect();
+            for (i, b) in order_seed.iter().enumerate() {
+                idx.swap(i % k, (*b as usize) % k);
+            }
+            for &i in &idx {
+                assert_eq!(
+                    bob.decrypt(&msgs[i], &alice_id, &bob_id).unwrap(),
+                    format!("m{i}").as_bytes(),
+                    "out-of-order message {i} must decrypt to its own plaintext"
+                );
+            }
+        });
+    }
+
+    /// P4d: the PQXDH first-message (prekey) decrypt path round-trips, and any
+    /// tampering of the wrapped message fails closed. The bundle/identities (the
+    /// expensive ML-KEM keygen) are built once; each input gets a fresh session.
+    #[test]
+    fn prop_prekey_path_fail_closed() {
+        let alice_identity = IdentityKeyPair::generate();
+        let bob_identity = IdentityKeyPair::generate();
+        let alice_id = alice_identity.public_key();
+        let bob_id = bob_identity.public_key();
+        let (bundle, spk_private, opk_private, dk_seed) = make_bundle(&bob_identity, true);
+        let spk_public = *bundle.signed_pre_key_public.as_bytes();
+        check!()
+            .with_type::<(Vec<u8>, bool)>()
+            .for_each(|(pt, tamper)| {
+                let pqxdh = crate::protocol::pqxdh::process_prekey_bundle(&alice_identity, &bundle)
+                    .unwrap();
+                let mut alice =
+                    RatchetSession::initialize_alice(&pqxdh.shared_secret, &spk_public).unwrap();
+                let mut prekey_msg = alice
+                    .encrypt_prekey_message(pt, &alice_id, &bob_id, &pqxdh.initial_message)
+                    .unwrap();
+                if *tamper {
+                    if prekey_msg.message.ciphertext.is_empty() {
+                        return;
+                    }
+                    let last = prekey_msg.message.ciphertext.len() - 1;
+                    prekey_msg.message.ciphertext[last] ^= 0xFF;
+                    let r = RatchetSession::decrypt_prekey_message(
+                        &prekey_msg,
+                        &bob_identity,
+                        &spk_private,
+                        &spk_public,
+                        opk_private.as_ref(),
+                        &dk_seed,
+                    );
+                    assert!(r.is_err(), "tampered prekey message must fail closed");
+                } else {
+                    let (_bob, plaintext) = RatchetSession::decrypt_prekey_message(
+                        &prekey_msg,
+                        &bob_identity,
+                        &spk_private,
+                        &spk_public,
+                        opk_private.as_ref(),
+                        &dk_seed,
+                    )
+                    .unwrap();
+                    assert_eq!(&plaintext, pt);
+                }
+            });
+    }
 }

@@ -1,0 +1,81 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Blocking gate: runs the real Rust. `cargo test` includes the bolero
+  # property bodies (each ~1s) alongside the existing suite, and replays any
+  # committed reproducers under src/**/__fuzz__/<target>/{crashes,corpus}.
+  test:
+    name: test (stable, blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: test
+        run: cargo test --all-targets
+      - name: doctests
+        run: cargo test --doc
+
+  # Non-blocking smoke: time-boxed libfuzzer run of each security-critical
+  # property on nightly. Starts non-blocking (continue-on-error) so it is
+  # visible before being promoted to a gate once the corpus is stable.
+  fuzz-smoke:
+    name: fuzz-smoke (nightly, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # `id` is a filesystem/artifact-safe slug; `target` is the fully-qualified
+        # test path cargo-bolero needs to select the harness.
+        include:
+          - id: ciphertext_mutation
+            target: protocol::ratchet::tests::prop_ciphertext_mutation_fails_closed
+          - id: ad_binding
+            target: protocol::ratchet::tests::prop_ad_binding_fails_closed
+          - id: codeword
+            target: protocol::ratchet::tests::prop_codeword_strip_or_garble_fails_closed
+          - id: prekey
+            target: protocol::ratchet::tests::prop_prekey_path_fail_closed
+          - id: replay
+            target: protocol::ratchet::spqr::tests::prop_replay_fails_closed
+          - id: out_of_order
+            target: protocol::ratchet::tests::prop_out_of_order_within_chain
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-bolero
+        run: cargo install cargo-bolero --locked
+      - name: Fuzz ${{ matrix.id }} (60s)
+        run: cargo bolero test ${{ matrix.target }} --engine libfuzzer -T 60s
+      # A reproducer found here lands under src/**/__fuzz__/<target>/crashes;
+      # commit it so the blocking `test` job replays it forever.
+      - name: Upload any reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-${{ matrix.id }}
+          path: src/**/__fuzz__/**
+          if-no-files-found: ignore
