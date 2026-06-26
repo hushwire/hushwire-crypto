@@ -112,4 +112,21 @@ mod tests {
         let padded = pad(msg);
         assert_eq!(unpad(&padded).unwrap(), msg);
     }
+
+    /// P4c: `unpad` is the exact inverse of `pad` for any plaintext, and a buffer
+    /// with no `0x80` marker is rejected (`InvalidPadding`, never partial
+    /// plaintext). Runs as a unit test under `cargo test` and a fuzz target under
+    /// `cargo bolero test prop_pad_unpad --engine libfuzzer`.
+    #[test]
+    fn prop_pad_unpad_roundtrip_and_reject() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|msg| {
+            // `pad` always lands on a block boundary and round-trips exactly.
+            let padded = pad(msg);
+            assert_eq!(padded.len() % BLOCK_SIZE, 0);
+            assert_eq!(unpad(&padded).unwrap(), msg.as_slice());
+            // An all-zero block carries no marker -> must fail closed.
+            let zeros = [0u8; BLOCK_SIZE];
+            assert!(matches!(unpad(&zeros), Err(CryptoError::InvalidPadding)));
+        });
+    }
 }

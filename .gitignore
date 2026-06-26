@@ -5,6 +5,11 @@ lcov.info
 *.profraw
 crap-*.json
 
+# bolero fuzz: the exploration corpus is regenerated on every run (and cached in
+# CI), so it is not tracked. Crash reproducers under __fuzz__/<target>/crashes/
+# ARE tracked (see TESTING.md) so the blocking `test` job replays them forever.
+**/__fuzz__/**/corpus/
+
 .zed
 .idea
 .DS_Store

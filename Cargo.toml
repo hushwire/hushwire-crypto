@@ -41,3 +41,16 @@ serde_json = "1.0"
 # Independent RS implementation, used only for the braid differential test.
 reed-solomon-erasure = "6.0.0"
 rand_chacha = "0.10.0"
+# Property/fuzz/Kani front-end: one property body runs as a `cargo test` unit
+# test, a `cargo bolero test --engine libfuzzer` fuzz target, and (later) a
+# `--engine kani` harness over the real decrypt/replay paths.
+bolero = "0.13"
+
+# Build profile used by `cargo bolero test` (the libfuzzer/AFL engines require
+# it). Optimized but with debug assertions and overflow checks kept on so the
+# fuzzer trips Rust's own safety checks, not just explicit asserts.
+[profile.fuzz]
+inherits = "release"
+debug = 2
+debug-assertions = true
+overflow-checks = true

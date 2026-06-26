@@ -611,7 +611,10 @@ mod tests {
             for _ in 0..BURST {
                 let (msg, pqn, mk_a) = alice.ratchet_send_key(&mut ra).unwrap();
                 let mk_b = bob.ratchet_receive_key(&msg, pqn).unwrap();
-                assert_eq!(mk_a, mk_b, "alice->bob pq_mk must pair under receive-heavy load");
+                assert_eq!(
+                    mk_a, mk_b,
+                    "alice->bob pq_mk must pair under receive-heavy load"
+                );
                 bob_max_chains = bob_max_chains.max(bob.kdfchains.len());
             }
             // Bob's sole reply per burst -- this is the only place Bob's chains prune.
@@ -636,5 +639,106 @@ mod tests {
              send-driven pruning must keep this bounded by the epoch gap, not message volume",
             80 * BURST
         );
+    }
+
+    // ── Property-based replay / epoch coverage (bolero) ──────────────────────
+    //
+    // These run as fast `cargo test` unit tests (bolero's ~1s default budget per
+    // property) and as libfuzzer targets under `cargo bolero test <name>
+    // --engine libfuzzer` (later, Kani under `--engine kani`). Unlike the
+    // ratchet-level properties, the SPQR API takes an explicit RNG, so these are
+    // seeded deterministically from the input and fully reproducible.
+    use bolero::check;
+
+    /// P5: a replayed (already-received) `(epoch, pq_n)` fails closed for any send
+    /// sequence — generalizes `replay_fails_closed`.
+    #[test]
+    fn prop_replay_fails_closed() {
+        check!()
+            .with_type::<(u64, u8)>()
+            .for_each(|(seed, count_raw)| {
+                let ss = [0x21u8; 32];
+                let mut alice = SpqrState::new_sender(&ss);
+                let mut bob = SpqrState::new_receiver(&ss);
+                let mut ra = ChaCha20Rng::seed_from_u64(*seed);
+                let k = 1 + (*count_raw % 16) as usize;
+                let mut sent = Vec::new();
+                for _ in 0..k {
+                    let (msg, pqn, mk) = alice.ratchet_send_key(&mut ra).unwrap();
+                    assert_eq!(bob.ratchet_receive_key(&msg, pqn).unwrap(), mk);
+                    sent.push((msg, pqn));
+                }
+                for (msg, pqn) in &sent {
+                    assert!(
+                        bob.ratchet_receive_key(msg, *pqn).is_err(),
+                        "replay of a consumed PQ message must fail closed"
+                    );
+                }
+            });
+    }
+
+    /// P6: out-of-order delivery within a chain pairs every message via the
+    /// skipped-key store, for an arbitrary delivery permutation.
+    #[test]
+    fn prop_out_of_order_pairs() {
+        check!()
+            .with_type::<(u64, Vec<u8>)>()
+            .for_each(|(seed, order)| {
+                let ss = [0x37u8; 32];
+                let mut alice = SpqrState::new_sender(&ss);
+                let mut bob = SpqrState::new_receiver(&ss);
+                let mut ra = ChaCha20Rng::seed_from_u64(*seed);
+                let k = 2 + (order.len() % 8); // within MAX_SKIP, single epoch
+                let msgs: Vec<(Message, u32, MessageKey)> = (0..k)
+                    .map(|_| alice.ratchet_send_key(&mut ra).unwrap())
+                    .collect();
+                let mut idx: Vec<usize> = (0..k).collect();
+                for (i, b) in order.iter().enumerate() {
+                    idx.swap(i % k, (*b as usize) % k);
+                }
+                for &i in &idx {
+                    assert_eq!(
+                        bob.ratchet_receive_key(&msgs[i].0, msgs[i].1).unwrap(),
+                        msgs[i].2,
+                        "out-of-order delivery must pair"
+                    );
+                }
+            });
+    }
+
+    /// P7: a receive-heavy duplex keeps the retained epoch-chain set bounded by
+    /// the braid handshake depth, NOT by message volume — generalizes
+    /// `receive_heavy_peer_retained_epochs_stay_bounded` to arbitrary burst
+    /// schedules. The `<= 8` ceiling (current epoch + a small handshake lead +
+    /// the two-behind retention window) is the structural bound; per-message
+    /// growth would blow far past it.
+    #[test]
+    fn prop_retained_epochs_bounded() {
+        check!()
+            .with_type::<(u64, u64, Vec<u8>)>()
+            .for_each(|(sa, sb, sched)| {
+                let ss = [0x55u8; 32];
+                let mut alice = SpqrState::new_sender(&ss);
+                let mut bob = SpqrState::new_receiver(&ss);
+                let mut ra = ChaCha20Rng::seed_from_u64(*sa);
+                let mut rb = ChaCha20Rng::seed_from_u64(*sb);
+                let mut bob_max = 0usize;
+                for b in sched.iter().take(48) {
+                    let burst = 1 + (*b % 8) as usize;
+                    for _ in 0..burst {
+                        let (msg, pqn, mk_a) = alice.ratchet_send_key(&mut ra).unwrap();
+                        assert_eq!(bob.ratchet_receive_key(&msg, pqn).unwrap(), mk_a);
+                        bob_max = bob_max.max(bob.kdfchains.len());
+                    }
+                    // Bob's single reply per burst is the only place his chains prune.
+                    let (msg, pqn, mk_b) = bob.ratchet_send_key(&mut rb).unwrap();
+                    assert_eq!(alice.ratchet_receive_key(&msg, pqn).unwrap(), mk_b);
+                    bob_max = bob_max.max(bob.kdfchains.len());
+                }
+                assert!(
+                    bob_max <= 8,
+                    "retained epoch chains must stay bounded by handshake depth, got {bob_max}"
+                );
+            });
     }
 }
